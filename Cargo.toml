@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hickory-client = "0.25.2"
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "net", "time"] }
