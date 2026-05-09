@@ -107,7 +107,6 @@ async fn main() {
     let mut rng = Rng::new();
 
     println!("== phase 1: walk delegation chain (NS {name}) ==");
-    println!("(one query per hop, random pick, failover to next on timeout)");
     println!();
     let chain = match chain_walk(name.clone(), RecordType::NS, &mut rng, 0).await {
         Ok(c) => c,
