@@ -120,7 +120,7 @@ async fn main() {
     print_steps(&chain.steps, 0);
 
     let parent_ns_set: HashSet<&Name> = chain.parent_ns.iter().collect();
-    let apex_ns: Vec<Name> = chain
+    let apex_answer_ns: Vec<Name> = chain
         .apex_answer
         .iter()
         .filter_map(|r| match r.data() {
@@ -128,9 +128,21 @@ async fn main() {
             _ => None,
         })
         .collect();
+    let nodata_at_auth = chain.apex_answer.is_empty();
+    let apex_ns: Vec<Name> = if apex_answer_ns.is_empty() {
+        chain.parent_ns.clone()
+    } else {
+        apex_answer_ns
+    };
     let apex_ns_set: HashSet<&Name> = apex_ns.iter().collect();
 
-    if parent_ns_set != apex_ns_set {
+    if nodata_at_auth {
+        println!(
+            "note: queried name is not a zone apex; using parent's delegation NS ({}) as the authoritative set",
+            chain.parent_label
+        );
+        println!();
+    } else if parent_ns_set != apex_ns_set {
         println!("note: parent delegation NS set differs from apex NS RRset");
         println!("  parent ({}):", chain.parent_label);
         let mut parent_sorted: Vec<&Name> = parent_ns_set.iter().copied().collect();
@@ -316,6 +328,9 @@ async fn chain_walk(
 
         let ns_names = extract_ns_names(&resp.authority);
         if ns_names.is_empty() {
+            let is_nodata = resp.aa
+                && resp.rcode == ResponseCode::NoError
+                && !last_referral_authority.is_empty();
             steps.push(Step {
                 server_label: server_label.clone(),
                 server_addr,
@@ -329,6 +344,16 @@ async fn chain_walk(
                 skipped,
                 sub: Vec::new(),
             });
+            if is_nodata {
+                return Ok(ChainResult {
+                    steps,
+                    parent_ns: extract_ns_names(&last_referral_authority),
+                    parent_glue: last_referral_additional,
+                    apex_answer: Vec::new(),
+                    auth_label: server_label,
+                    parent_label: last_referral_label,
+                });
+            }
             return Err(format!(
                 "{server_label} returned no answer and no NS records (rcode={:?})",
                 steps.last().unwrap().rcode
