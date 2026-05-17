@@ -3,6 +3,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hickory_client::client::{Client, ClientHandle};
@@ -31,6 +32,14 @@ const ROOT_SERVERS: &[(&str, [u8; 4])] = &[
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HOPS: usize = 16;
 const MAX_DEPTH: u32 = 8;
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+macro_rules! vlog {
+    ($($arg:tt)*) => { if verbose() { eprintln!($($arg)*); } };
+}
 
 struct Rng(u64);
 impl Rng {
@@ -77,11 +86,20 @@ fn parse_record_type(s: &str) -> Option<RecordType> {
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "-v" || a == "--verbose") {
+        VERBOSE.store(true, Ordering::Relaxed);
+        args.retain(|a| a != "-v" && a != "--verbose");
+    }
     if args.len() < 2 || args.len() > 3 || args[1] == "-h" || args[1] == "--help" {
-        eprintln!("usage: chkdns <domain> [type]");
+        eprintln!("chkdns: walk DNS delegation from root to authoritative servers");
+        eprintln!("and query each authoritative server directly, bypassing resolver");
+        eprintln!("caches. Useful for verifying a record right after changing it.");
+        eprintln!();
+        eprintln!("usage: chkdns [-v] <domain> [type]");
         eprintln!("  type defaults to A. examples: A, AAAA, NS, MX, TXT, SOA, CAA");
         eprintln!("  ANY is accepted but most servers refuse it (RFC 8482)");
+        eprintln!("  -v / --verbose: log each server attempt to stderr");
         process::exit(2);
     }
     let domain = &args[1];
@@ -279,25 +297,71 @@ async fn chain_walk(
         let mut chosen: Option<(String, SocketAddr, DnsResp)> = None;
         let mut skipped: Vec<(String, SocketAddr, String)> = Vec::new();
 
+        let pad = " ".repeat(depth as usize * 2);
+        vlog!(
+            "{pad}> hop {} {qtype} {name}: {} candidate(s) (referral from {last_referral_label})",
+            steps.len(),
+            current_candidates.len(),
+        );
         for (label, addr) in &current_candidates {
             if visited.contains(addr) {
+                vlog!("{pad}>   {label} ({addr}): already visited, skip");
                 skipped.push((label.clone(), *addr, "already visited".into()));
                 continue;
             }
             match timeout(QUERY_TIMEOUT, query(*addr, name.clone(), qtype)).await {
                 Ok(Ok(resp)) => {
+                    vlog!(
+                        "{pad}>   {label} ({addr}): ok rcode={:?} aa={} ans={} auth={} add={}",
+                        resp.rcode, resp.aa, resp.answers.len(), resp.authority.len(), resp.additional.len(),
+                    );
                     visited.insert(*addr);
                     chosen = Some((label.clone(), *addr, resp));
                     break;
                 }
-                Ok(Err(e)) => skipped.push((label.clone(), *addr, format!("error: {e}"))),
-                Err(_) => skipped.push((label.clone(), *addr, "timeout".into())),
+                Ok(Err(e)) => {
+                    vlog!("{pad}>   {label} ({addr}): error: {e}");
+                    skipped.push((label.clone(), *addr, format!("error: {e}")));
+                }
+                Err(_) => {
+                    vlog!("{pad}>   {label} ({addr}): timeout after {:?}", QUERY_TIMEOUT);
+                    skipped.push((label.clone(), *addr, "timeout".into()));
+                }
             }
         }
 
         let (server_label, server_addr, resp) = match chosen {
             Some(t) => t,
-            None => return Err("all candidates failed at this hop".into()),
+            None => {
+                let mut msg = format!(
+                    "hop {} failed: all {} candidate(s) for {} {} unreachable (referral from {})",
+                    steps.len(),
+                    current_candidates.len(),
+                    qtype,
+                    name,
+                    last_referral_label,
+                );
+                for (label, addr, reason) in &skipped {
+                    msg.push_str(&format!("\n  {label} ({addr}): {reason}"));
+                }
+                let tried: HashSet<String> = current_candidates
+                    .iter()
+                    .map(|(label, _)| label.clone())
+                    .collect();
+                let untried: Vec<String> = extract_ns_names(&last_referral_authority)
+                    .into_iter()
+                    .map(|n| n.to_string())
+                    .filter(|n| !tried.contains(n))
+                    .collect();
+                if !untried.is_empty() {
+                    msg.push_str(&format!(
+                        "\n  {} other NS in referral not tried (no usable address): {}",
+                        untried.len(),
+                        untried.join(", "),
+                    ));
+                }
+                return Err(msg.into());
+            }
         };
 
         let answers_present = !resp.answers.is_empty();
@@ -373,7 +437,9 @@ async fn chain_walk(
 
         let mut sub_chains: Vec<(Name, Vec<Step>)> = Vec::new();
         if next_candidates.is_empty() {
+            vlog!("{pad}>   no glue from referral; resolving NS names from root");
             for ns_name in &ns_names {
+                vlog!("{pad}>   sub-resolve {ns_name} A");
                 let result =
                     Box::pin(chain_walk(ns_name.clone(), RecordType::A, rng, depth + 1)).await;
                 match result {
@@ -491,14 +557,25 @@ async fn poll_auths(
         let mut errors: Vec<String> = Vec::new();
         for ip in &shuffled {
             let addr = SocketAddr::new(*ip, 53);
+            vlog!("> poll {ns_name} {addr} {qtype}");
             match timeout(QUERY_TIMEOUT, query(addr, name.clone(), qtype)).await {
                 Ok(Ok(resp)) => {
+                    vlog!(
+                        ">   ok rcode={:?} aa={} ans={}",
+                        resp.rcode, resp.aa, resp.answers.len(),
+                    );
                     print_auth_response(ns_name, addr, qtype, &resp);
                     answered = true;
                     break;
                 }
-                Ok(Err(e)) => errors.push(format!("{addr}: error: {e}")),
-                Err(_) => errors.push(format!("{addr}: timeout")),
+                Ok(Err(e)) => {
+                    vlog!(">   error: {e}");
+                    errors.push(format!("{addr}: error: {e}"));
+                }
+                Err(_) => {
+                    vlog!(">   timeout after {:?}", QUERY_TIMEOUT);
+                    errors.push(format!("{addr}: timeout"));
+                }
             }
         }
         if !answered {
