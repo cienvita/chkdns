@@ -334,7 +334,7 @@ async fn chain_walk(
             Some(t) => t,
             None => {
                 let mut msg = format!(
-                    "hop {} failed: all {} candidate(s) for {} {} unreachable (referral from {})",
+                    "hop {} failed: no usable response from any of {} candidate(s) for {} {} (referral from {})",
                     steps.len(),
                     current_candidates.len(),
                     qtype,
