@@ -91,15 +91,22 @@ async fn main() {
         VERBOSE.store(true, Ordering::Relaxed);
         args.retain(|a| a != "-v" && a != "--verbose");
     }
+    let check_parents = args.iter().any(|a| a == "-n" || a == "--parent-ns");
+    if check_parents {
+        args.retain(|a| a != "-n" && a != "--parent-ns");
+    }
     if args.len() < 2 || args.len() > 3 || args[1] == "-h" || args[1] == "--help" {
         eprintln!("chkdns: walk DNS delegation from root to authoritative servers");
         eprintln!("and query each authoritative server directly, bypassing resolver");
         eprintln!("caches. Useful for verifying a record right after changing it.");
         eprintln!();
-        eprintln!("usage: chkdns [-v] <domain> [type]");
+        eprintln!("usage: chkdns [-v] [-n] <domain> [type]");
         eprintln!("  type defaults to A. examples: A, AAAA, NS, MX, TXT, SOA, CAA");
         eprintln!("  ANY is accepted but most servers refuse it (RFC 8482)");
         eprintln!("  -v / --verbose: log each server attempt to stderr");
+        eprintln!("  -n / --parent-ns: query every parent-zone server (e.g. all");
+        eprintln!("    .com gtld servers) for the NS delegation and check they agree;");
+        eprintln!("    useful right after changing nameservers at the registrar");
         process::exit(2);
     }
     let domain = &args[1];
@@ -177,6 +184,15 @@ async fn main() {
         println!();
     }
 
+    if check_parents {
+        let parent_zone = name.base_name();
+        println!(
+            "== parent-zone check: NS {name} across all {parent_zone} servers =="
+        );
+        println!();
+        poll_parents(&name, &chain.parent_servers).await;
+    }
+
     println!("== phase 2: query each authoritative server ({qtype} {name}) ==");
     println!();
     poll_auths(&name, qtype, &chain, &apex_ns, &mut rng).await;
@@ -203,6 +219,10 @@ struct ChainResult {
     apex_answer: Vec<Record>,
     auth_label: String,
     parent_label: String,
+    // every server in the parent zone that held the delegation to the apex
+    // (e.g. all .com gtld servers for example.com), with the addresses we had
+    // glue for. Only the top-level (depth 0) walk's value is meaningful.
+    parent_servers: Vec<(String, SocketAddr)>,
 }
 
 struct DnsResp {
@@ -285,6 +305,10 @@ async fn chain_walk(
     let mut current_candidates = roots;
     let mut steps: Vec<Step> = Vec::new();
     let mut visited: HashSet<SocketAddr> = HashSet::new();
+    // candidate set of the most recent referral hop, i.e. the servers of the
+    // parent zone that delegate to the apex. Seeded with the roots in case the
+    // first hop answers directly.
+    let mut parent_servers: Vec<(String, SocketAddr)> = current_candidates.clone();
     let mut last_referral_authority: Vec<Record> = Vec::new();
     let mut last_referral_additional: Vec<Record> = Vec::new();
     let mut last_referral_label: String = String::from("(none)");
@@ -387,6 +411,7 @@ async fn chain_walk(
                 apex_answer: resp.answers,
                 auth_label: server_label,
                 parent_label: last_referral_label,
+                parent_servers,
             });
         }
 
@@ -416,6 +441,7 @@ async fn chain_walk(
                     apex_answer: Vec::new(),
                     auth_label: server_label,
                     parent_label: last_referral_label,
+                    parent_servers,
                 });
             }
             return Err(format!(
@@ -467,6 +493,9 @@ async fn chain_walk(
 
         rng.shuffle(&mut next_candidates);
 
+        // the servers we just queried at this referral hop are the parent zone's
+        // server set; capture them before current_candidates is reassigned.
+        parent_servers = current_candidates.clone();
         last_referral_authority = resp.authority.clone();
         last_referral_additional = resp.additional.clone();
         last_referral_label = server_label.clone();
@@ -586,6 +615,92 @@ async fn poll_auths(
         }
         println!();
     }
+}
+
+async fn poll_parents(name: &Name, parent_servers: &[(String, SocketAddr)]) {
+    if parent_servers.is_empty() {
+        println!("(no parent-zone servers captured; nothing to check)");
+        println!();
+        return;
+    }
+
+    // one entry per address; keep the first label seen for each.
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut servers: Vec<(String, SocketAddr)> = Vec::new();
+    for (label, addr) in parent_servers {
+        if seen.insert(*addr) {
+            servers.push((label.clone(), *addr));
+        }
+    }
+    servers.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    // (label, Some(sorted NS names) | None on failure)
+    let mut results: Vec<(String, Option<Vec<String>>)> = Vec::new();
+    for (label, addr) in &servers {
+        vlog!("> parent {label} ({addr}) NS {name}");
+        match timeout(QUERY_TIMEOUT, query(*addr, name.clone(), RecordType::NS)).await {
+            Ok(Ok(resp)) => {
+                // a parent server delegates rather than answering, so the NS
+                // RRset lives in the authority section; include answers too in
+                // case the server is also authoritative for the zone.
+                let mut ns: Vec<String> = extract_ns_names(&resp.answers)
+                    .into_iter()
+                    .chain(extract_ns_names(&resp.authority))
+                    .map(|n| n.to_string())
+                    .collect();
+                ns.sort();
+                ns.dedup();
+                let aa = if resp.aa { " AA" } else { "" };
+                println!(
+                    "[{label} {addr}] rcode={:?}{aa} {} NS record(s)",
+                    resp.rcode,
+                    ns.len()
+                );
+                if ns.is_empty() {
+                    println!("  (no NS records)");
+                } else {
+                    for n in &ns {
+                        println!("  {n}");
+                    }
+                }
+                results.push((label.clone(), Some(ns)));
+            }
+            Ok(Err(e)) => {
+                println!("[{label} {addr}] error: {e}");
+                results.push((label.clone(), None));
+            }
+            Err(_) => {
+                println!("[{label} {addr}] timeout");
+                results.push((label.clone(), None));
+            }
+        }
+        println!();
+    }
+
+    let answered = results.iter().filter(|(_, v)| v.is_some()).count();
+    let failed = results.len() - answered;
+    let distinct: HashSet<&Vec<String>> =
+        results.iter().filter_map(|(_, v)| v.as_ref()).collect();
+
+    match distinct.len() {
+        0 => println!("no parent-zone server returned an NS set"),
+        1 => println!(
+            "all {answered} responding parent-zone server(s) agree on the NS set ({} record(s))",
+            distinct.iter().next().map(|s| s.len()).unwrap_or(0)
+        ),
+        n => {
+            println!("parent-zone servers DISAGREE on the NS set ({n} distinct answers):");
+            for (label, v) in &results {
+                if let Some(ns) = v {
+                    println!("  {label}: {}", ns.join(", "));
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        println!("({failed} parent-zone server(s) did not respond)");
+    }
+    println!();
 }
 
 fn print_auth_response(ns_name: &Name, addr: SocketAddr, qtype: RecordType, resp: &DnsResp) {
